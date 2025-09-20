@@ -12,15 +12,16 @@ class FrameData {
 
 class CameraService {
   final ResolutionPreset preset;
-  CameraController? _controller;
+  CameraController? _controller; // <-- nullable
   CameraDescription? camera;
   final _out = StreamController<FrameData>.broadcast();
   bool _streaming = false;
 
   CameraService({this.preset = ResolutionPreset.medium});
 
-  CameraController? get controller => _controller;
+  CameraController? get controller => _controller; // <-- nullable getter
   bool get isInitialized => _controller?.value.isInitialized ?? false;
+
   Stream<FrameData> get frames => _out.stream;
 
   Future<void> init() async {
@@ -30,12 +31,14 @@ class CameraService {
       orElse: () => cameras.first,
     );
     _controller = CameraController(
-      camera!,
-      preset,
+      camera!, preset,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
     await _controller!.initialize();
+    print('sensor=${controller!.description.sensorOrientation} '
+        'device=${controller!.value.deviceOrientation} '
+        'lens=${controller!.description.lensDirection}');
   }
 
   Future<void> start({int downsample = 2, int outSize = 192}) async {
@@ -45,13 +48,17 @@ class CameraService {
     await _controller!.startImageStream((CameraImage img) async {
       if (!_streaming) return;
       i++; if (i % downsample != 0) return;
+
       final rgb = await compute<_ConvertParams, Uint8List>(
         _convertWorker,
-        _ConvertParams(img, outSize),
+        _ConvertParams(img, outSize), // outSize == 192
       );
-      final sz = _controller!.value.previewSize!;
-      _out.add(FrameData(rgb, outSize, sz.width.toInt(), sz.height.toInt()));
+
+      // ✅ Tell consumers the source space is the model input (192×192), not the camera frame
+      _out.add(FrameData(rgb, outSize, outSize, outSize));
     });
+
+
   }
 
   Future<void> stop() async {
@@ -75,8 +82,8 @@ class _ConvertParams {
 Uint8List _convertWorker(_ConvertParams p) {
   final img = p.img;
   final out = p.outSize;
-  final w = img.width, h = img.height;
 
+  final srcW = img.width, srcH = img.height;
   final y = img.planes[0];
   final u = img.planes[1];
   final v = img.planes[2];
@@ -89,25 +96,34 @@ Uint8List _convertWorker(_ConvertParams p) {
   final uRowStride = u.bytesPerRow;
   final vRowStride = v.bytesPerRow;
 
-  final uPixStride = u.bytesPerPixel ?? 1;
+  final uPixStride = u.bytesPerPixel ?? 1; // 1: I420, 2: NV12/NV21
   final vPixStride = v.bytesPerPixel ?? 1;
+
+  // --- center-crop to square (cover) ---
+  final crop = srcW < srcH ? srcW : srcH;
+  final cropX = (srcW - crop) >> 1;
+  final cropY = (srcH - crop) >> 1;
 
   final outW = out, outH = out;
   final rgb = Uint8List(outW * outH * 3);
 
-  final xRatio = w / outW;
-  final yRatio = h / outH;
+  // scale from cropped square -> out
+  final xRatio = crop / outW;
+  final yRatio = crop / outH;
 
   int o = 0;
   for (int oy = 0; oy < outH; oy++) {
-    final sy = (oy * yRatio).floor();
+    final syInCrop = (oy * yRatio).floor();      // 0..crop-1
+    final sy = cropY + syInCrop;                  // 0..srcH-1
+
     final uvSy = sy >> 1;
     final yBase = sy * yRowStride;
     final uBase = uvSy * uRowStride;
     final vBase = uvSy * vRowStride;
 
     for (int ox = 0; ox < outW; ox++) {
-      final sx = (ox * xRatio).floor();
+      final sxInCrop = (ox * xRatio).floor();    // 0..crop-1
+      final sx = cropX + sxInCrop;                // 0..srcW-1
       final uvSx = sx >> 1;
 
       final yIndex = yBase + sx;
@@ -118,10 +134,15 @@ Uint8List _convertWorker(_ConvertParams p) {
       int U = uBytes[uIndex];
       int V = vBytes[vIndex];
 
-      final c = Y - 16; final d = U - 128; final e = V - 128;
+      // BT.601 YUV -> RGB
+      final c = Y - 16;
+      final d = U - 128;
+      final e = V - 128;
+
       int r = (298 * c + 409 * e + 128) >> 8;
       int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
       int b = (298 * c + 516 * d + 128) >> 8;
+
       if (r < 0) r = 0; else if (r > 255) r = 255;
       if (g < 0) g = 0; else if (g > 255) g = 255;
       if (b < 0) b = 0; else if (b > 255) b = 255;
@@ -131,6 +152,5 @@ Uint8List _convertWorker(_ConvertParams p) {
       rgb[o++] = b;
     }
   }
-
   return rgb;
 }

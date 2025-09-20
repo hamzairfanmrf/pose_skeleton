@@ -18,6 +18,10 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>NSCameraUsageDescription</key>
+    <string>This app uses the camera to detect your pose and draw a 2D skeleton.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This app may use the microphone when recording video.</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>

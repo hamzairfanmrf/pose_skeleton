@@ -83,18 +83,21 @@ class MoveNet {
       // [1,1,17,3] => (y, x, score)
       final out = output as List;
       final kp = <Keypoint>[];
+      // inside _isSinglePose branch
       for (int i = 0; i < 17; i++) {
         final y = out[0][0][i][0] as double;
         final x = out[0][0][i][1] as double;
         final s = out[0][0][i][2] as double;
         kp.add(Keypoint(
           keypointNames[i],
-          Offset(x * sourceSize.width, y * sourceSize.height),
+          Offset(x, y), // keep normalized [0..1]
           s,
         ));
       }
+
       return Pose(kp);
-    } else if (_isMultiPose(_outShape)) {
+    }
+ else if (_isMultiPose(_outShape)) {
       // [1, N, 56] => up to N persons; 56 = 17*3 + 5 meta
       final out = output as List;
       final persons = out[0] as List;
@@ -117,10 +120,11 @@ class MoveNet {
         final s = row[j * 3 + 2] as double;
         kp.add(Keypoint(
           keypointNames[j],
-          Offset(x * sourceSize.width, y * sourceSize.height),
+          Offset(x, y), // normalized
           s,
         ));
       }
+
       return Pose(kp);
     } else {
       throw StateError('Unknown MoveNet output shape: $_outShape');
