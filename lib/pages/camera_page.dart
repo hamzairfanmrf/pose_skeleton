@@ -1,14 +1,17 @@
+// lib/pages/camera_page.dart
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle, DeviceOrientation;
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+
 import '../ml/pose_types.dart';
 import '../services/camera_service.dart';
 import '../services/pose_isolate.dart';
 import '../painters/pose_painter.dart';
 import '../utils/fps_counter.dart';
+import '../services/pose_isolate.dart' as pose;
 
 class CameraPage extends StatefulWidget {
   const CameraPage({super.key});
@@ -17,15 +20,21 @@ class CameraPage extends StatefulWidget {
 }
 
 class _CameraPageState extends State<CameraPage> {
-  final cam = CameraService(preset: ResolutionPreset.medium);
-  late final PoseIsolate iso;
-  Size? latestSourceSize;
-  SendPort? isoPort;
   final fps = FpsCounter();
   Pose? currentPose;
+
   bool performanceMode = true;
   int downsample = 2;
+  final cam = CameraService(preset: ResolutionPreset.medium);
+
   StreamSubscription? _sub;
+  FrameData? lastFrame;
+
+  late final pose.PoseIsolate iso; // <-- prefixed
+  SendPort? isoPort;
+
+  // rotation tweak button
+  int _rotAdjust = 0; // tap button to cycle 0/90/180/270
 
   @override
   void initState() {
@@ -33,32 +42,37 @@ class _CameraPageState extends State<CameraPage> {
     _bootstrap();
   }
 
+  // ...
+
   Future<void> _bootstrap() async {
     await cam.init();
-    final ByteData bd = await rootBundle.load('assets/models/movenet_lightning.tflite');
-    final Uint8List modelBytes = bd.buffer.asUint8List();
 
-    iso = PoseIsolate();
+    // load your correct model
+    final bd = await rootBundle.load('assets/models/movenet2.tflite');
+    final modelBytes = bd.buffer.asUint8List();
+
+    // start isolate (prefixed)
+    iso = pose.PoseIsolate();
     isoPort = await iso.start(modelBytes, inputSize: 192);
 
-    await cam.start(downsample: performanceMode ? downsample : 1, outSize: 192);
+    await cam.start(downsample: true ? 2 : 1, outSize: 192);
     _sub = cam.frames.listen(_onFrame);
 
     setState(() {});
   }
 
+// 1) In _onFrame: store the frame, then set pose
   Future<void> _onFrame(FrameData frame) async {
-    latestSourceSize = Size(frame.size.toDouble(), frame.size.toDouble()); // ✅ 192x192
+    if (isoPort == null) return;
+
+    lastFrame = frame; // <-- ADD THIS
 
     final recv = ReceivePort();
-    isoPort!.send([
-      recv.sendPort,
-      PoseRequest(frame.rgb, latestSourceSize!), // MoveNet expects this space too
-    ]);
-    final resp = await recv.first as PoseResponse;
+    isoPort!.send([recv.sendPort, pose.PoseRequest(frame.rgb, const Size(1, 1))]);
+    final resp = await recv.first as pose.PoseResponse;
 
     setState(() {
-      currentPose = resp.pose; // (apply smoothing if you use it)
+      currentPose = resp.pose;
       fps.tick();
     });
   }
@@ -69,11 +83,13 @@ class _CameraPageState extends State<CameraPage> {
     _sub?.cancel();
     cam.stop();
     cam.dispose();
+    iso.dispose(); // <-- prefixed
     super.dispose();
   }
-  int rotationImageToDisplay(CameraController c) {
-    final sensor = c.description.sensorOrientation; // e.g., 90 or 270
 
+  // Compute rotation from image (sensor) to display (CameraPreview)
+  int rotationImageToDisplay(CameraController c) {
+    final sensor = c.description.sensorOrientation;
     final map = {
       DeviceOrientation.portraitUp: 0,
       DeviceOrientation.landscapeLeft: 90,
@@ -81,38 +97,42 @@ class _CameraPageState extends State<CameraPage> {
       DeviceOrientation.landscapeRight: 270,
     };
     final device = map[c.value.deviceOrientation] ?? 0;
-
     final isFront = c.description.lensDirection == CameraLensDirection.front;
-    // delta from image (sensor) to what CameraPreview shows
     return isFront ? (sensor + device) % 360 : (sensor - device + 360) % 360;
   }
 
-  // in _CameraPageState
-  int _rotAdjust = 0; // tap the 🔄 button to add +90 each time
-
+  @override
   @override
   Widget build(BuildContext context) {
     if (!cam.isInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
     }
 
     final ctrl = cam.controller!;
-    final rot = (rotationImageToDisplay(ctrl) + _rotAdjust) % 360;
-    final isFront = ctrl.description.lensDirection == CameraLensDirection.front;
 
     return Scaffold(
       body: LayoutBuilder(
         builder: (context, constraints) {
           final box = constraints.biggest;
+          final side = box.shortestSide;
+          final cropDisp = Rect.fromLTWH(
+            (box.width - side) / 2,
+            (box.height - side) / 2,
+            side,
+            side,
+          );
 
           final pv = ctrl.value.previewSize!;
-          final previewW = pv.height;
+          final previewW = pv.height; // swapped
           final previewH = pv.width;
+
 
           return Stack(
             fit: StackFit.expand,
             children: [
-              // FULL-SCREEN preview, cover
+              // Camera preview
               SizedBox.expand(
                 child: FittedBox(
                   fit: BoxFit.cover,
@@ -124,39 +144,17 @@ class _CameraPageState extends State<CameraPage> {
                 ),
               ),
 
-              // SKELETON overlay (expects normalized coords)
-              CustomPaint(
-                size: box,
-                painter: PosePainter(
-                  currentPose,
-                  displaySize: box,
-                  rotationDeg: rot,
-                  mirrorX: isFront,
-                  conf: 0.40,
-                ),
-              ),
-
-              // === UI chips and a rotation calibrator ===
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Row(
-                    children: [
-                      _Chip(text: 'MoveNet Lightning'),
-                      const SizedBox(width: 8),
-                      _Chip(text: '${fps.fps.toStringAsFixed(1)} FPS'),
-                      const Spacer(),
-                      IconButton(
-                        tooltip: 'Rotate overlay +90°',
-                        icon: const Icon(Icons.rotate_90_degrees_cw),
-                        onPressed: () {
-                          setState(() { _rotAdjust = (_rotAdjust + 90) % 360; });
-                        },
-                      ),
-                    ],
+              // Skeleton overlay
+              if (currentPose != null)
+                CustomPaint(
+                  size: box,
+                  painter: PosePainter(
+                    currentPose,
+                    displaySize: box,
+                    cropInDisplay: cropDisp,
+                    conf: 0.03, // raise threshold now
                   ),
                 ),
-              ),
             ],
           );
         },
@@ -164,18 +162,21 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-
 }
 
 class _Chip extends StatelessWidget {
-  final String text; const _Chip({required this.text});
+  final String text;
+  const _Chip({required this.text});
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
     decoration: BoxDecoration(
-      color: Colors.black.withOpacity(0.5),
+      color: Colors.black.withOpacity(0.55),
       borderRadius: BorderRadius.circular(12),
     ),
-    child: Text(text, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+    child: Text(
+      text,
+      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+    ),
   );
 }
