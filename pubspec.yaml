@@ -67,6 +67,7 @@ flutter:
   assets:
     - assets/models/movenet_lightning.tflite
     - assets/models/movenet2.tflite
+    - assets/models/lite-model_movenet_singlepose_lightning_tflite_float16_4.tflite
   #   - images/a_dot_ham.jpeg
 
   # An image asset can refer to one or more resolution-specific "variants", see
