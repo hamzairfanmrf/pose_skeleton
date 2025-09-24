@@ -1,17 +1,14 @@
-// lib/pages/camera_page.dart  (only the interesting parts shown)
 import 'dart:async';
-import 'dart:isolate';
 import 'dart:typed_data';
-import 'package:flutter/services.dart' show rootBundle, DeviceOrientation;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:camera/camera.dart';
 
 import '../ml/pose_types.dart';
-import '../services/camera_service.dart';
-import '../services/pose_isolate.dart' as pose;
+import '../ml/movenet.dart';
 import '../painters/pose_painter.dart';
-import '../utils/fps_counter.dart';
-import '../utils/pose_stabilizer.dart';
+// Make sure the file name matches your actual file: yuv_converter.dart
+import '../utils/yuv_convert.dart';
 
 class CameraPage extends StatefulWidget {
   const CameraPage({super.key});
@@ -20,158 +17,145 @@ class CameraPage extends StatefulWidget {
 }
 
 class _CameraPageState extends State<CameraPage> {
-  final fps = FpsCounter();
-  final cam = CameraService(preset: ResolutionPreset.medium);
-  final stabilizer = PoseStabilizer(alpha: 0.4, appear: 0.15, disappear: 0.07);
-
-  Pose? currentPose;
-  pose.PoseIsolate? iso;
-  SendPort? isoPort;
-  StreamSubscription? _sub;
-
-  int _rotAdjust = 0;
+  CameraController? _controller;
+  MoveNet? _net;
+  Pose? _pose;
+  int _skip = 0; // simple frame skipping for perf
 
   @override
-  void initState() { super.initState(); _bootstrap(); }
+  void initState() {
+    super.initState();
+    _initAll();
+  }
 
-  Future<void> _bootstrap() async {
-    await cam.init();
+  Future<void> _initAll() async {
+    // 1) Camera
+    final cameras = await availableCameras();
+    final back = cameras.firstWhere(
+          (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
 
-    final bd = await rootBundle.load(
+    _controller = CameraController(
+      back,
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
+    await _controller!.initialize();
+
+    // 2) Model
+    final model = await rootBundle.load(
       'assets/models/lite-model_movenet_singlepose_lightning_tflite_float16_4.tflite',
     );
-    final modelBytes = bd.buffer.asUint8List();
+    _net = await MoveNet.load(model.buffer.asUint8List(), inputSize: 192, threads: 4);
 
-    iso = pose.PoseIsolate();
-    isoPort = await iso!.start(modelBytes, inputSize: 192);
+    // 3) Stream + inference (THIS is where your snippet lives)
+    await _controller!.startImageStream((CameraImage camImg) async {
+      // Light frame skipping (process every 2nd frame)
+      _skip = (_skip + 1) % 2;
+      if (_skip != 0) return;
 
-    await cam.start(downsample: 2, outSize: 192);
-    _sub = cam.frames.listen(_onFrame);
+      final net = _net;
+      if (net == null) return;
 
-    setState(() {});
-  }
+      // 1) YUV → ARGB image
+      final rgbImage = yuv420ToImage(camImg);
 
-  Future<void> _onFrame(FrameData f) async {
-    if (isoPort == null) return;
-    final recv = ReceivePort();
-    isoPort!.send([recv.sendPort, pose.PoseRequest(f.rgb, const Size(1, 1))]);
-    final resp = await recv.first as pose.PoseResponse;
-    setState(() { currentPose = stabilizer.update(resp.pose); fps.tick(); });
+      // 2) Run MoveNet (handles resize/normalize internally to 192×192)
+      final pose = net.inferFromImage(rgbImage);
+
+      // 3) Update UI
+      if (!mounted) return;
+      setState(() => _pose = pose);
+    });
+
+    if (mounted) setState(() {});
   }
 
   @override
-  void dispose() { _sub?.cancel(); cam.stop(); cam.dispose(); iso?.dispose(); super.dispose(); }
-
-  int rotationImageToDisplay(CameraController c) {
-    final sensor = c.description.sensorOrientation;
-    final map = {
-      DeviceOrientation.portraitUp: 0,
-      DeviceOrientation.landscapeLeft: 90,
-      DeviceOrientation.portraitDown: 180,
-      DeviceOrientation.landscapeRight: 270,
-    };
-    final device = map[c.value.deviceOrientation] ?? 0;
-    final isFront = c.description.lensDirection == CameraLensDirection.front;
-    return isFront ? (sensor + device) % 360 : (sensor - device + 360) % 360;
+  void dispose() {
+    _controller?.dispose();
+    _net?.close();
+    super.dispose();
   }
 
-  // Compute where the preview lands on screen with BoxFit.cover
-  Rect _fittedRect(Size src, Size dst) {
-    final scale = (dst.width / src.width > dst.height / src.height)
-        ? dst.width / src.width
-        : dst.height / src.height;
-    final w = src.width * scale, h = src.height * scale;
-    final left = (dst.width - w) / 2, top = (dst.height - h) / 2;
-    return Rect.fromLTWH(left, top, w, h);
+  // Compute the on-screen rectangle of the camera preview (BoxFit.cover)
+  Rect _previewRectOnScreen(Size screen, Size src) {
+    final fitted = applyBoxFit(BoxFit.cover, src, screen);
+    return Alignment.center.inscribe(fitted.destination, Offset.zero & screen);
+  }
+
+  // Sensor preview size converted to portrait
+  Size _srcSizePortrait(CameraController c) {
+    final pv = c.value.previewSize!;
+    return Size(pv.height, pv.width); // swap to portrait
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!cam.isInitialized) {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-
-    final ctrl = cam.controller!;
-    final rot = (rotationImageToDisplay(ctrl) + _rotAdjust) % 360;
-    final isFront = ctrl.description.lensDirection == CameraLensDirection.front;
 
     return Scaffold(
       body: LayoutBuilder(
         builder: (context, constraints) {
-          // inside LayoutBuilder -> builder:
           final box = constraints.biggest;
 
-// The camera stream size as we feed into FittedBox:
-          final pv = ctrl.value.previewSize!;
-          final srcSize = Size(pv.height, pv.width); // swap to portrait
+          // Use your actual controller
+          final controller = _controller!;
+          final pv = controller.value.previewSize!;
+          final srcSize = Size(pv.height, pv.width); // portrait orientation
 
-// Ask Flutter how BoxFit.cover will scale src into the screen box
-          final fittedSizes = applyBoxFit(BoxFit.cover, srcSize, box);
-          final dest = Alignment.center.inscribe(fittedSizes.destination, Offset.zero & box);
-
-// 'dest' is the *exact* rectangle where the preview is drawn on screen
-          final previewRectOnScreen = dest;
-          final fitted = _fittedRect(srcSize, box);
+          // Where the CameraPreview is drawn on screen (BoxFit.cover)
+          final fitted = applyBoxFit(BoxFit.cover, srcSize, box);
+          final previewRect =
+          Alignment.center.inscribe(fitted.destination, Offset.zero & box);
 
           return Stack(
             fit: StackFit.expand,
             children: [
-              // Preview matches fitted rect via BoxFit.cover
+              // Camera preview
               SizedBox.expand(
                 child: FittedBox(
                   fit: BoxFit.cover,
                   child: SizedBox(
                     width: srcSize.width,
                     height: srcSize.height,
-                    child: CameraPreview(ctrl),
+                    child: CameraPreview(controller),
                   ),
                 ),
               ),
 
-              if (currentPose != null)
+              // DOTS overlay (use _pose, not currentPose)
+              if (_pose != null)
                 CustomPaint(
                   size: box,
                   painter: PosePainter(
-                    currentPose,
-                    fullInDisplay: fitted,   // <— draw in the same rect as preview
-                    rotationDeg: rot,
-                    mirrorX: isFront,
-                    conf: 0.25,
+                    _pose,
+                    previewOnScreen: previewRect,
+                    srcSize: srcSize,
+                    conf: 0.5,
+                    radius: 4,
+                    color: Colors.yellow,
+                    mirrorX: false,   // back camera only
+                    rotationDeg: 0,   // set 90/180/270 if needed
                   ),
                 ),
-
-              // Chips + rotation tweak
-              SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Row(
-                    children: [
-                      const _Chip(text: 'MoveNet Lightning (fp16)'),
-                      const SizedBox(width: 8),
-                      _Chip(text: '${fps.fps.toStringAsFixed(1)} FPS'),
-                      const Spacer(),
-                      IconButton(
-                        tooltip: 'Rotate overlay +90°',
-                        icon: const Icon(Icons.rotate_90_degrees_cw),
-                        color: Colors.white,
-                        onPressed: () => setState(() {
-                          _rotAdjust = (_rotAdjust + 90) % 360;
-                        }),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
             ],
           );
         },
       ),
     );
+
   }
 }
 
 class _Chip extends StatelessWidget {
-  final String text; const _Chip({required this.text});
+  final String text;
+  const _Chip({required this.text});
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -179,10 +163,9 @@ class _Chip extends StatelessWidget {
       color: Colors.black.withOpacity(0.55),
       borderRadius: BorderRadius.circular(12),
     ),
-    child: Text(text,
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.w600,
-        )),
+    child: Text(
+      text,
+      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+    ),
   );
 }

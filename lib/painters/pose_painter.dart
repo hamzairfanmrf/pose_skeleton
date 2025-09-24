@@ -1,79 +1,111 @@
+// lib/painters/pose_painter.dart
 import 'package:flutter/material.dart';
 import '../ml/pose_types.dart';
 
-/// Draws only keypoint dots at the model's normalized positions.
-/// It maps (x,y in 0..1) into the same fitted rectangle where the
-/// camera preview is rendered.
+/// Draws pose keypoints as dots, mapping normalized (0..1) coords
+/// from the *full source frame* to the exact on-screen preview rect
+/// painted with BoxFit.cover.
+///
+/// NO crop math here. If you used a center-crop before, remove it
+/// (or set srcSize to that crop and pass the preview rect that shows it).
 class PosePainter extends CustomPainter {
   final Pose? pose;
-  final Rect fullInDisplay;   // where the camera frame sits on screen
-  final double conf;          // confidence threshold
-  final int rotationDeg;      // 0/90/180/270 image->display rotation
-  final bool mirrorX;         // true for front camera
-  final double radius;        // dot radius
-  final Color color;          // dot color
 
-  PosePainter(
+  /// The exact rectangle where CameraPreview is drawn on screen.
+  final Rect previewOnScreen;
+
+  /// Source sensor size expressed in the same orientation you used for preview,
+  /// e.g. Size(pv.height, pv.width) for portrait UI.
+  final Size srcSize;
+
+  /// Confidence threshold for drawing.
+  final double conf;
+
+  /// Dot appearance.
+  final double radius;
+  final Color color;
+
+  /// Visual tweaks.
+  final bool mirrorX;     // true for front camera
+  final int rotationDeg;  // 0 / 90 / 180 / 270
+
+  const PosePainter(
       this.pose, {
-        required this.fullInDisplay,
-        this.conf = 0.25,
-        this.rotationDeg = 0,
+        required this.previewOnScreen,
+        required this.srcSize,
+        this.conf = 0.45,
+        this.radius = 4,
+        this.color = Colors.yellow,
         this.mirrorX = false,
-        this.radius = 4.0,
-        this.color = Colors.cyanAccent,
+        this.rotationDeg = 0,
       });
-
-  Offset _normToRect(Offset n) => Offset(
-    fullInDisplay.left + n.dx * fullInDisplay.width,
-    fullInDisplay.top  + n.dy * fullInDisplay.height,
-  );
-
-  Offset _applyMirror(Offset p) {
-    if (!mirrorX) return p;
-    final cx = fullInDisplay.center.dx;
-    return Offset(2 * cx - p.dx, p.dy);
-  }
-
-  Offset _applyRotation(Offset p) {
-    final r = rotationDeg % 360;
-    if (r == 0) return p;
-    final c = fullInDisplay.center;
-    final dx = p.dx - c.dx, dy = p.dy - c.dy;
-    switch (r) {
-      case 90:  return Offset(c.dx - dy, c.dy + dx);
-      case 180: return Offset(c.dx - dx, c.dy - dy);
-      case 270: return Offset(c.dx + dy, c.dy - dx);
-      default:  return p;
-    }
-  }
-
-  Offset _toDisplay(Offset norm) =>
-      _applyRotation(_applyMirror(_normToRect(norm)));
 
   @override
   void paint(Canvas canvas, Size size) {
     final p = pose;
     if (p == null) return;
 
+    // Scale factors from source pixels -> screen pixels
+    final sx = previewOnScreen.width  / srcSize.width;
+    final sy = previewOnScreen.height / srcSize.height;
+
     final dot = Paint()
       ..color = color
       ..style = PaintingStyle.fill;
 
-    for (var i = 0; i < p.keypoints.length && i < 17; i++) {
-      final k = p.keypoints[i];
+    for (final k in p.keypoints) {
       if (k.score < conf) continue;
-      final pt = _toDisplay(k.position); // position is normalized (x,y)
-      canvas.drawCircle(pt, radius, dot);
+
+      // 1) normalized -> source px
+      double x = k.position.dx * srcSize.width;
+      double y = k.position.dy * srcSize.height;
+
+      // 2) optional rotation in source space (around the source center)
+      if (rotationDeg % 360 != 0) {
+        final cx = srcSize.width  * 0.5;
+        final cy = srcSize.height * 0.5;
+
+        final dx = x - cx;
+        final dy = y - cy;
+
+        switch (rotationDeg % 360) {
+          case 90:   // clockwise
+            x = cx + dy;
+            y = cy - dx;
+            break;
+          case 180:
+            x = cx - dx;
+            y = cy - dy;
+            break;
+          case 270:
+            x = cx - dy;
+            y = cy + dx;
+            break;
+        }
+      }
+
+      // 3) optional mirror (flip horizontally)
+      if (mirrorX) {
+        x = srcSize.width - x;
+      }
+
+      // 4) source -> screen
+      final scrX = previewOnScreen.left + x * sx;
+      final scrY = previewOnScreen.top  + y * sy;
+
+      canvas.drawCircle(Offset(scrX, scrY), radius, dot);
     }
   }
 
   @override
-  bool shouldRepaint(covariant PosePainter old) =>
-      old.pose != pose ||
-          old.fullInDisplay != fullInDisplay ||
-          old.conf != conf ||
-          old.rotationDeg != rotationDeg ||
-          old.mirrorX != mirrorX ||
-          old.radius != radius ||
-          old.color != color;
+  bool shouldRepaint(covariant PosePainter old) {
+    return old.pose != pose ||
+        old.previewOnScreen != previewOnScreen ||
+        old.srcSize != srcSize ||
+        old.conf != conf ||
+        old.radius != radius ||
+        old.color != color ||
+        old.mirrorX != mirrorX ||
+        old.rotationDeg != rotationDeg;
+  }
 }

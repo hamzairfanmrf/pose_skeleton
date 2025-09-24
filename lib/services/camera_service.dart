@@ -48,10 +48,11 @@ class CameraService {
 
     _controller = CameraController(
       camera!,
-      preset,
+      ResolutionPreset.low, // <= try low for speed on Redmi Note 10 5G
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
+
     await _controller!.initialize();
 
     // Debug once
@@ -68,27 +69,16 @@ class CameraService {
     int i = 0;
     await _controller!.startImageStream((CameraImage img) async {
       if (!_streaming) return;
+      if ((++i % downsample) != 0) return;
 
-      // simple frame skip for perf mode
-      i++;
-      if (i % downsample != 0) return;
+      // run conversion on this isolate (no compute())
+      final res = _convertWorker(_ConvertParams(img, outSize));
 
-      final res = await compute<_ConvertParams, _ConvertResult>(
-        _convertWorker,
-        _ConvertParams(img, outSize),
-      );
+      _out.add(FrameData(res.rgb, outSize, res.srcW, res.srcH, /* crop fields not used */ 0,0,0));
 
-      _out.add(FrameData(
-        res.rgb,
-        outSize,
-        res.srcW,
-        res.srcH,
-        res.cropX,
-        res.cropY,
-        res.cropSize,
-      ));
     });
   }
+
 
   Future<void> stop() async {
     if (!_streaming || _controller == null) return;
@@ -108,6 +98,7 @@ class CameraService {
 
 // ---------- background converter (runs in compute) ----------
 
+// in camera_service.dart (or wherever your converter lives)
 class _ConvertParams {
   final CameraImage img;
   final int outSize;
@@ -115,24 +106,17 @@ class _ConvertParams {
 }
 
 class _ConvertResult {
-  final Uint8List rgb;
+  final Uint8List rgb; // NHWC packed RGB (outSize*outSize*3)
   final int srcW, srcH;
-  final int cropX, cropY, cropSize;
-  const _ConvertResult(this.rgb, this.srcW, this.srcH, this.cropX, this.cropY, this.cropSize);
+  const _ConvertResult(this.rgb, this.srcW, this.srcH);
 }
 
-/// YUV420 (I420/NV21/NV12) -> RGB at outSize×outSize
-/// Performs a centered **square crop** in source space, then nearest-neighbor resize.
+// Stretch resize: whole sensor frame -> out×out, no crop/pad (like Android ResizeOp(192,192))
 _ConvertResult _convertWorker(_ConvertParams p) {
   final img = p.img;
   final out = p.outSize;
 
   final srcW = img.width, srcH = img.height;
-
-  // Center square crop (like BoxFit.cover)
-  final crop = srcW < srcH ? srcW : srcH;
-  final cropX = (srcW - crop) >> 1;
-  final cropY = (srcH - crop) >> 1;
 
   final yPlane = img.planes[0];
   final uPlane = img.planes[1];
@@ -142,49 +126,41 @@ _ConvertResult _convertWorker(_ConvertParams p) {
   final uBytes = uPlane.bytes;
   final vBytes = vPlane.bytes;
 
-  final yRowStride = yPlane.bytesPerRow;
-  final uRowStride = uPlane.bytesPerRow;
-  final vRowStride = vPlane.bytesPerRow;
+  final yRow = yPlane.bytesPerRow;
+  final uRow = uPlane.bytesPerRow;
+  final vRow = vPlane.bytesPerRow;
 
-  // bytesPerPixel: 1 for planar (I420), 2 for interleaved (NV21/NV12)
-  final uPixStride = uPlane.bytesPerPixel ?? 1;
-  final vPixStride = vPlane.bytesPerPixel ?? 1;
+  final uPix = uPlane.bytesPerPixel ?? 1;
+  final vPix = vPlane.bytesPerPixel ?? 1;
 
   final outW = out, outH = out;
   final rgb = Uint8List(outW * outH * 3);
 
-  // map from output pixel -> source crop coordinate
-  final xRatio = crop / outW;
-  final yRatio = crop / outH;
+  // independent scales (NO aspect lock)
+  final scaleX = srcW / outW;
+  final scaleY = srcH / outH;
 
   int o = 0;
   for (int oy = 0; oy < outH; oy++) {
-    final syCrop = (oy * yRatio).floor(); // 0..crop-1
-    final sy = cropY + syCrop;            // 0..srcH-1
+    final sy = (oy * scaleY).floor().clamp(0, srcH - 1);
     final uvSy = sy >> 1;
-
-    final yBase = sy * yRowStride;
-    final uBase = uvSy * uRowStride;
-    final vBase = uvSy * vRowStride;
+    final yBase = sy * yRow, uBase = uvSy * uRow, vBase = uvSy * vRow;
 
     for (int ox = 0; ox < outW; ox++) {
-      final sxCrop = (ox * xRatio).floor(); // 0..crop-1
-      final sx = cropX + sxCrop;            // 0..srcW-1
+      final sx = (ox * scaleX).floor().clamp(0, srcW - 1);
       final uvSx = sx >> 1;
 
       final Y = yBytes[yBase + sx];
-      final U = uBytes[uBase + uvSx * uPixStride];
-      final V = vBytes[vBase + uvSx * vPixStride];
+      final U = uBytes[uBase + uvSx * uPix];
+      final V = vBytes[vBase + uvSx * vPix];
 
-      // BT.601 full-range YUV -> RGB
+      // BT.601 fast YUV->RGB
       final c = Y - 16;
       final d = U - 128;
       final e = V - 128;
-
       int r = (298 * c + 409 * e + 128) >> 8;
       int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
       int b = (298 * c + 516 * d + 128) >> 8;
-
       if (r < 0) r = 0; else if (r > 255) r = 255;
       if (g < 0) g = 0; else if (g > 255) g = 255;
       if (b < 0) b = 0; else if (b > 255) b = 255;
@@ -193,5 +169,6 @@ _ConvertResult _convertWorker(_ConvertParams p) {
     }
   }
 
-  return _ConvertResult(rgb, srcW, srcH, cropX, cropY, crop);
+  return _ConvertResult(rgb, srcW, srcH);
 }
+

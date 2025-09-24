@@ -1,59 +1,24 @@
-// lib/pose_types.dart
-import 'package:flutter/material.dart';
+import 'dart:typed_data';
+import 'dart:ui';
+import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
 
 class Keypoint {
   final String name;
-  final Offset position; // in source/model space
+  final Offset position; // normalized [0..1] (x,y)
   final double score;
-  const Keypoint(this.name, this.position, this.score);
+  Keypoint(this.name, this.position, this.score);
 }
 
 class Pose {
   final List<Keypoint> keypoints;
-  const Pose(this.keypoints);
+  Pose(this.keypoints);
 }
 
-/// MoveNet keypoint order 0..16
-const List<String> keypointNames = [
-  'nose',            // 0
-  'leftEye',         // 1
-  'rightEye',        // 2
-  'leftEar',         // 3
-  'rightEar',        // 4
-  'leftShoulder',    // 5
-  'rightShoulder',   // 6
-  'leftElbow',       // 7
-  'rightElbow',      // 8
-  'leftWrist',       // 9
-  'rightWrist',      // 10
-  'leftHip',         // 11
-  'rightHip',        // 12
-  'leftKnee',        // 13
-  'rightKnee',       // 14
-  'leftAnkle',       // 15
-  'rightAnkle',      // 16
+const keypointNames = <String>[
+  'nose','leftEye','rightEye','leftEar','rightEar',
+  'leftShoulder','rightShoulder','leftElbow','rightElbow',
+  'leftWrist','rightWrist','leftHip','rightHip',
+  'leftKnee','rightKnee','leftAnkle','rightAnkle',
 ];
 
-/// Standard skeleton edges for MoveNet
-const List<List<String>> skeletonPairs = [
-  // face/neck
-  ['leftEye', 'rightEye'],
-  ['leftEye', 'leftEar'],
-  ['rightEye', 'rightEar'],
-  ['nose', 'leftEye'],
-  ['nose', 'rightEye'],
-  // shoulders / torso
-  ['leftShoulder', 'rightShoulder'],
-  ['leftShoulder', 'leftElbow'],
-  ['rightShoulder', 'rightElbow'],
-  ['leftElbow', 'leftWrist'],
-  ['rightElbow', 'rightWrist'],
-  ['leftShoulder', 'leftHip'],
-  ['rightShoulder', 'rightHip'],
-  ['leftHip', 'rightHip'],
-  // legs
-  ['leftHip', 'leftKnee'],
-  ['rightHip', 'rightKnee'],
-  ['leftKnee', 'leftAnkle'],
-  ['rightKnee', 'rightAnkle'],
-];
